@@ -3,6 +3,8 @@ from __future__ import annotations
 import struct
 from typing import Callable, Optional, TypeVar, TYPE_CHECKING
 
+from ._tachyon import PeerDeadError
+
 if TYPE_CHECKING:
 	from .rpc import RpcBus
 
@@ -128,31 +130,48 @@ class RpcDispatcher:
 		"""
 		Block until one request arrives, dispatch zero-copy to the handler, reply.
 
-		If no handler is registered for the received msg_type, a MSG_TYPE_ERROR
-		reply is sent to the caller so it is never left blocked, then KeyError
-		is raised locally.
+		The caller is never left blocked. If no handler is registered for the
+		received msg_type, or if the handler fails in any way (raises, returns a
+		value reply() cannot send, keeps a view of the request buffer alive past
+		the end of the call, ...), a MSG_TYPE_ERROR reply is sent on the same
+		correlation_id before the failure is raised locally.
 
 		:raise KeyboardInterrupt: Interrupted by signal during serve().
-		:raise PeerDeadError:     FatalError on arena_fwd.
+		:raise PeerDeadError:     FatalError on arena_fwd or arena_rev.
 		:raise KeyError:          No handler for msg_type (after an error reply is sent).
-		:raise Exception:         Any exception from the handler (after error reply sent).
+		:raise RuntimeError:      The handler failed (after an error reply is sent).
+		                          The original exception is attached as __cause__.
 		"""
-		with bus.serve(spin_threshold=spin_threshold) as rx:
-			cid = rx.correlation_id
-			mt = rx.type_id
-			handler = self._handlers.get(mt)
-			with memoryview(rx) as mv:
-				if handler is None:
-					response = None
-				else:
-					try:
+		cid = None
+		handler = None
+		try:
+			with bus.serve(spin_threshold=spin_threshold) as rx:
+				cid = rx.correlation_id
+				mt = rx.type_id
+				handler = self._handlers.get(mt)
+				if handler is not None:
+					with memoryview(rx) as mv:
 						response = handler._fn(mv)
-					except Exception:
-						response = None
-						exc_to_raise = _encode_error(mt)
-					# fall through: send error reply below
-					else:
-						exc_to_raise = None
+			# The request slot is released here; reply() may now be called.
+			if handler is not None:
+				bus.reply(cid, response, msg_type=mt)
+		except PeerDeadError:
+			raise
+		except Exception as exc:
+			if cid is None:
+				# serve() itself failed: no request was accepted, nothing to reply to.
+				raise
+			# Anything that went wrong between accepting the request and committing
+			# the reply must still be answered, or the caller blocks in wait() forever.
+			# This covers a handler that raised, but also one that returned a value
+			# reply() cannot send (None, str, int, a memoryview with the wrong item
+			# size, the released request view) or that kept a slice of the request
+			# buffer alive so that the serve() guard raised BufferError on exit.
+			bus.reply(cid, _encode_error(mt), msg_type=MSG_TYPE_ERROR)
+			raise RuntimeError(
+				f"Handler {handler.__name__!r} failed with {type(exc).__name__}: {exc} "
+				f"(error reply sent to caller, cid={cid})"
+			) from exc
 
 		if handler is None:
 			bus.reply(cid, _encode_error(mt), msg_type=MSG_TYPE_ERROR)
@@ -160,15 +179,6 @@ class RpcDispatcher:
 				f"No handler registered for msg_type={mt} "
 				f"(error reply sent to caller, cid={cid})"
 			)
-
-		if exc_to_raise is not None:
-			bus.reply(cid, exc_to_raise, msg_type=MSG_TYPE_ERROR)
-			raise RuntimeError(
-				f"Handler {handler.__name__!r} raised an exception "
-				f"(error reply sent to caller, cid={cid})"
-			)
-
-		bus.reply(cid, response, msg_type=mt)
 
 	def serve_forever(self, bus: "RpcBus", spin_threshold: int = 10000) -> None:
 		"""
