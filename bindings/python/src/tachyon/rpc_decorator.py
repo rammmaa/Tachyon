@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from typing import Callable, Optional, TypeVar, TYPE_CHECKING
 
-from ._tachyon import PeerDeadError
+from ._tachyon import PeerDeadError, TachyonError
 
 if TYPE_CHECKING:
 	from .rpc import RpcBus
@@ -18,6 +18,24 @@ def _encode_error(unhandled_mt: int) -> bytes:
 
 def _decode_error(payload: bytes) -> int:
 	return struct.unpack(_ERROR_FMT, payload[:2])[0]
+
+
+def _send_error_reply(bus: "RpcBus", cid: int, mt: int) -> str:
+	"""
+	Best-effort MSG_TYPE_ERROR reply for a request that cannot be answered normally.
+
+	acquire_reply() does not retry, so a full arena_rev raises TachyonError. That
+	must not replace the failure being reported (nor take serve_forever() down),
+	so it is swallowed here; only a dead peer propagates. The returned string
+	says what happened, for the exception message.
+	"""
+	try:
+		bus.reply(cid, _encode_error(mt), msg_type=MSG_TYPE_ERROR)
+	except PeerDeadError:
+		raise
+	except TachyonError as exc:
+		return f"error reply could not be sent: {exc}"
+	return "error reply sent to caller"
 
 
 T = TypeVar("T")
@@ -130,16 +148,18 @@ class RpcDispatcher:
 		"""
 		Block until one request arrives, dispatch zero-copy to the handler, reply.
 
-		The caller is never left blocked. If no handler is registered for the
-		received msg_type, or if the handler fails in any way (raises, returns a
-		value reply() cannot send, keeps a view of the request buffer alive past
-		the end of the call, ...), a MSG_TYPE_ERROR reply is sent on the same
-		correlation_id before the failure is raised locally.
+		A failing handler does not leave the caller blocked in wait(). If no handler
+		is registered for the received msg_type, or if the handler fails in any way
+		(raises, returns a value reply() cannot send, keeps a view of the request
+		buffer alive past the end of the call, ...), a MSG_TYPE_ERROR reply is sent
+		on the same correlation_id before the failure is raised locally. That error
+		reply is best-effort: if arena_rev is full it is skipped, the failure is
+		still raised here and its message says the caller was not answered.
 
 		:raise KeyboardInterrupt: Interrupted by signal during serve().
 		:raise PeerDeadError:     FatalError on arena_fwd or arena_rev.
-		:raise KeyError:          No handler for msg_type (after an error reply is sent).
-		:raise RuntimeError:      The handler failed (after an error reply is sent).
+		:raise KeyError:          No handler for msg_type (after an error reply is attempted).
+		:raise RuntimeError:      The handler failed (after an error reply is attempted).
 		                          The original exception is attached as __cause__.
 		"""
 		cid = None
@@ -158,6 +178,13 @@ class RpcDispatcher:
 		except PeerDeadError:
 			raise
 		except Exception as exc:
+			# Drop the handler's return value first. For a handler that returned a
+			# slice of the request view, the serve() guard has already committed the
+			# slot before raising BufferError, so `response` (and the unreleased `mv`
+			# it was sliced from) point into a released slot; a traceback holding
+			# this frame would keep them alive.
+			response = None
+			mv = None
 			if cid is None:
 				# serve() itself failed: no request was accepted, nothing to reply to.
 				raise
@@ -167,17 +194,17 @@ class RpcDispatcher:
 			# reply() cannot send (None, str, int, a memoryview with the wrong item
 			# size, the released request view) or that kept a slice of the request
 			# buffer alive so that the serve() guard raised BufferError on exit.
-			bus.reply(cid, _encode_error(mt), msg_type=MSG_TYPE_ERROR)
+			outcome = _send_error_reply(bus, cid, mt)
 			raise RuntimeError(
 				f"Handler {handler.__name__!r} failed with {type(exc).__name__}: {exc} "
-				f"(error reply sent to caller, cid={cid})"
+				f"({outcome}, cid={cid})"
 			) from exc
 
 		if handler is None:
-			bus.reply(cid, _encode_error(mt), msg_type=MSG_TYPE_ERROR)
+			outcome = _send_error_reply(bus, cid, mt)
 			raise KeyError(
 				f"No handler registered for msg_type={mt} "
-				f"(error reply sent to caller, cid={cid})"
+				f"({outcome}, cid={cid})"
 			)
 
 	def serve_forever(self, bus: "RpcBus", spin_threshold: int = 10000) -> None:
